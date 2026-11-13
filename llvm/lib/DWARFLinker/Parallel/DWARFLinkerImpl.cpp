@@ -12,6 +12,7 @@
 #include "llvm/DebugInfo/DWARF/DWARFDebugAbbrev.h"
 #include "llvm/Support/EndianStream.h"
 #include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/LEB128.h"
 #include "llvm/Support/Parallel.h"
 #include "llvm/Support/ThreadPool.h"
 
@@ -1283,9 +1284,7 @@ void DWARFLinkerImpl::emitCommonSectionsAndWriteCompileUnitsToTheOutput() {
   if (llvm::is_contained(GlobalData.Options.AccelTables,
                          AccelTableKind::DebugNames)) {
     // Emit .debug_names section.
-    TG.spawn([&]() {
-      emitDWARFv5DebugNamesSection((*GlobalData.getTargetTriple()).get());
-    });
+    TG.spawn([&]() { emitDWARFv5DebugNamesSection(); });
   }
 }
 
@@ -1351,6 +1350,28 @@ public:
   template <typename T> void write(T Value) {
     support::endian::write(Buffer, Value, Endianness);
   }
+  void writeULEB128(uint64_t Value) {
+    appendLEB128<LEB128Sign::Unsigned>(Buffer, Value);
+  }
+  void writeBytes(StringRef Bytes) {
+    Buffer.append(Bytes.begin(), Bytes.end());
+  }
+  /// Writes \p Value as an unsigned integer of \p Size bytes.
+  void writeUInt(uint64_t Value, unsigned Size) {
+    switch (Size) {
+    case 1:
+      return write<uint8_t>(Value);
+    case 2:
+      return write<uint16_t>(Value);
+    case 4:
+      return write<uint32_t>(Value);
+    case 8:
+      return write<uint64_t>(Value);
+    }
+    llvm_unreachable("Unsupported integer size");
+  }
+  /// Reserves space for \p Size more bytes.
+  void reserve(uint64_t Size) { Buffer.reserve(Buffer.size() + Size); }
   /// \returns the number of bytes written so far.
   uint64_t size() const { return Buffer.size() - Start; }
 
@@ -1688,29 +1709,295 @@ void DWARFLinkerImpl::emitAppleAcceleratorSections(
     });
 }
 
-void DWARFLinkerImpl::emitDWARFv5DebugNamesSection(const Triple &TargetTriple) {
-  std::unique_ptr<DWARF5AccelTable> DebugNames;
+namespace {
+/// Builds the .debug_names table and writes its section contents directly.
+/// The output is byte-identical to filling a DWARF5AccelTable and emitting it
+/// through emitDWARF5AccelTable(), without the MC layer: no temporary symbol,
+/// no fixup and no object file to extract the section from.
+class DebugNamesTableBuilder {
+public:
+  struct Value {
+    uint64_t DieOffset;
+    std::optional<uint64_t> ParentOffset;
+    unsigned UnitID;
+    unsigned Tag;
+    bool IsTU;
+  };
 
-  DebugNamesUnitsOffsets CompUnits;
-  CompUnitIDToIdx CUidToIdx;
+  void addName(const StringEntry *Key,
+               const DwarfStringPoolEntryWithExtString &Name, Value V) {
+    auto [It, Inserted] = Index.try_emplace(Key, Entries.size());
+    if (Inserted)
+      Entries.push_back({&Name, caseFoldingDjbHash(Name.String), 0, 0});
+    ++Entries[It->second].NumValues;
+    Records.push_back({It->second, V});
+  }
+
+  void emit(SectionDescriptor &OutSection, ArrayRef<uint64_t> CompUnits,
+            const DenseMap<unsigned, unsigned> &CUidToIdx);
+
+private:
+  struct Entry {
+    const DwarfStringPoolEntryWithExtString *Name;
+    uint32_t HashValue;
+    /// The values of the entry are Values[FirstValue, FirstValue+NumValues).
+    uint32_t FirstValue;
+    uint32_t NumValues;
+  };
+
+  struct Record {
+    uint32_t EntryIdx;
+    Value V;
+  };
+
+  /// An abbreviation: the tag, and the form of DW_IDX_parent, if any. All
+  /// entries have the same DW_IDX_compile_unit and DW_IDX_die_offset.
+  struct Abbrev {
+    unsigned Tag;
+    std::optional<dwarf::Form> ParentForm;
+  };
+
+  DenseMap<const StringEntry *, uint32_t> Index;
+  std::vector<Entry> Entries;
+  std::vector<Record> Records;
+  std::vector<Value> Values;
+};
+
+void DebugNamesTableBuilder::emit(
+    SectionDescriptor &OutSection, ArrayRef<uint64_t> CompUnits,
+    const DenseMap<unsigned, unsigned> &CUidToIdx) {
+  // Group the values by entry, in insertion order, then sort them by DIE
+  // offset as in AccelTableBase::finalize().
+  uint32_t FirstValue = 0;
+  for (Entry &E : Entries) {
+    E.FirstValue = FirstValue;
+    FirstValue += E.NumValues;
+  }
+  Values.resize(Records.size());
+  {
+    std::vector<uint32_t> NextValue(Entries.size());
+    for (size_t I = 0; I < Entries.size(); ++I)
+      NextValue[I] = Entries[I].FirstValue;
+    for (const Record &R : Records)
+      Values[NextValue[R.EntryIdx]++] = R.V;
+    std::vector<Record>().swap(Records);
+  }
+  for (Entry &E : Entries)
+    std::stable_sort(Values.begin() + E.FirstValue,
+                     Values.begin() + E.FirstValue + E.NumValues,
+                     [](const Value &LHS, const Value &RHS) {
+                       return LHS.DieOffset < RHS.DieOffset;
+                     });
+
+  uint32_t UniqueHashCount = countUniqueHashes(Entries);
+  uint32_t BucketCount = dwarf::getDebugNamesBucketCount(UniqueHashCount);
+  std::vector<uint32_t> Order = orderByBucket(Entries, BucketCount);
+
+  // Entries have a DW_IDX_compile_unit when the table indexes several units.
+  bool HasUnitIndex = CUidToIdx.size() > 1;
+  dwarf::Form UnitIndexForm = DIEInteger::BestForm(
+      /*IsSigned*/ false, (uint64_t)CUidToIdx.size() - 1);
+  unsigned UnitIndexSize =
+      HasUnitIndex
+          ? *dwarf::getFixedFormByteSize(UnitIndexForm, {5, 4, dwarf::DWARF32})
+          : 0;
+
+  // The DIEs indexed by the table: DW_IDX_parent refers to the entry of a
+  // parent which is indexed, and is a flag for a parent which is not. They
+  // are only needed when some value has a parent.
+  auto Key = [](uint64_t Offset, const Value &V) {
+    return OffsetAndUnitID(Offset, V.UnitID, V.IsTU);
+  };
+  bool HasParents = llvm::any_of(
+      Values, [](const Value &V) { return V.ParentOffset.has_value(); });
+  DenseSet<OffsetAndUnitID> IndexedOffsets;
+  if (HasParents)
+    for (const Value &V : Values)
+      IndexedOffsets.insert(Key(V.DieOffset, V));
+
+  // Abbreviations are numbered in order of first use.
+  std::vector<uint32_t> AbbrevNumbers(Values.size());
+  SmallVector<Abbrev> Abbrevs;
+  {
+    DenseMap<std::pair<unsigned, unsigned>, uint32_t> AbbrevIndex;
+    for (uint32_t Idx : Order) {
+      const Entry &E = Entries[Idx];
+      for (uint32_t I = E.FirstValue; I < E.FirstValue + E.NumValues; ++I) {
+        const Value &V = Values[I];
+        std::optional<dwarf::Form> ParentForm;
+        if (V.ParentOffset)
+          ParentForm = IndexedOffsets.contains(Key(*V.ParentOffset, V))
+                           ? dwarf::DW_FORM_ref4
+                           : dwarf::DW_FORM_flag_present;
+        auto [It, Inserted] = AbbrevIndex.try_emplace(
+            {V.Tag, ParentForm ? unsigned(*ParentForm) : 0u},
+            Abbrevs.size() + 1);
+        if (Inserted)
+          Abbrevs.push_back({V.Tag, ParentForm});
+        AbbrevNumbers[I] = It->second;
+      }
+    }
+  }
+
+  auto EntrySize = [&](uint32_t ValueIdx) {
+    uint32_t Number = AbbrevNumbers[ValueIdx];
+    uint64_t Size = getULEB128Size(Number) + UnitIndexSize + 4;
+    if (Abbrevs[Number - 1].ParentForm == dwarf::DW_FORM_ref4)
+      Size += 4;
+    return Size;
+  };
+
+  // Offsets of the entries in the entry pool, for DW_IDX_parent: the first
+  // entry of a DIE, in emission order.
+  DenseMap<OffsetAndUnitID, uint64_t> DIEOffsetToEntryOffset;
+  uint64_t EntryPoolSize = 0;
+  for (uint32_t Idx : Order) {
+    const Entry &E = Entries[Idx];
+    for (uint32_t I = E.FirstValue; I < E.FirstValue + E.NumValues; ++I) {
+      if (HasParents)
+        DIEOffsetToEntryOffset.try_emplace(Key(Values[I].DieOffset, Values[I]),
+                                           EntryPoolSize);
+      EntryPoolSize += EntrySize(I);
+    }
+    EntryPoolSize += 1; // End of list.
+  }
+
+  uint64_t AbbrevTableSize = 1;
+  for (unsigned I = 0; I < Abbrevs.size(); ++I) {
+    AbbrevTableSize += getULEB128Size(I + 1) + getULEB128Size(Abbrevs[I].Tag);
+    if (HasUnitIndex)
+      AbbrevTableSize += getULEB128Size(dwarf::DW_IDX_compile_unit) +
+                         getULEB128Size(UnitIndexForm);
+    AbbrevTableSize += getULEB128Size(dwarf::DW_IDX_die_offset) +
+                       getULEB128Size(dwarf::DW_FORM_ref4);
+    if (Abbrevs[I].ParentForm)
+      AbbrevTableSize += getULEB128Size(dwarf::DW_IDX_parent) +
+                         getULEB128Size(*Abbrevs[I].ParentForm);
+    AbbrevTableSize += 2;
+  }
+
+  const uint32_t NameCount = Entries.size();
+  const char Augmentation[8] = {'L', 'L', 'V', 'M', '0', '7', '0', '0'};
+  uint64_t HeaderSize = 2 + 2 + 4 * 7 + sizeof(Augmentation);
+  uint64_t Size = HeaderSize + 4 * CompUnits.size() + 4 * BucketCount +
+                  4 * NameCount * 3 + AbbrevTableSize + EntryPoolSize;
+  uint64_t Padding = offsetToAlignment(4 + Size, Align(4));
+
+  SectionWriter W(OutSection);
+  W.reserve(4 + Size + Padding);
+
+  // Header.
+  W.write<uint32_t>(Size + Padding);
+  W.write<uint16_t>(5);
+  W.write<uint16_t>(0);
+  W.write<uint32_t>(CompUnits.size());
+  W.write<uint32_t>(0);
+  W.write<uint32_t>(0);
+  W.write<uint32_t>(BucketCount);
+  W.write<uint32_t>(NameCount);
+  W.write<uint32_t>(AbbrevTableSize);
+  W.write<uint32_t>(sizeof(Augmentation));
+  W.writeBytes(StringRef(Augmentation, sizeof(Augmentation)));
+
+  // Compile units.
+  for (uint64_t CUOffset : CompUnits)
+    W.write<uint32_t>(CUOffset);
+
+  // Buckets: 1-based index of the first name of each bucket.
+  {
+    size_t Pos = 0;
+    uint32_t NameIndex = 1;
+    for (uint32_t Bucket = 0; Bucket < BucketCount; ++Bucket) {
+      size_t Begin = Pos;
+      while (Pos < Order.size() &&
+             Entries[Order[Pos]].HashValue % BucketCount == Bucket)
+        ++Pos;
+      W.write<uint32_t>(Pos == Begin ? 0 : NameIndex);
+      NameIndex += Pos - Begin;
+    }
+  }
+
+  // Hashes, string offsets and entry offsets of all names.
+  for (uint32_t Idx : Order)
+    W.write<uint32_t>(Entries[Idx].HashValue);
+  for (uint32_t Idx : Order)
+    W.write<uint32_t>(Entries[Idx].Name->Offset);
+  {
+    uint64_t EntryOffset = 0;
+    for (uint32_t Idx : Order) {
+      const Entry &E = Entries[Idx];
+      W.write<uint32_t>(EntryOffset);
+      for (uint32_t I = E.FirstValue; I < E.FirstValue + E.NumValues; ++I)
+        EntryOffset += EntrySize(I);
+      EntryOffset += 1;
+    }
+  }
+
+  // Abbreviations.
+  for (unsigned I = 0; I < Abbrevs.size(); ++I) {
+    W.writeULEB128(I + 1);
+    W.writeULEB128(Abbrevs[I].Tag);
+    if (HasUnitIndex) {
+      W.writeULEB128(dwarf::DW_IDX_compile_unit);
+      W.writeULEB128(UnitIndexForm);
+    }
+    W.writeULEB128(dwarf::DW_IDX_die_offset);
+    W.writeULEB128(dwarf::DW_FORM_ref4);
+    if (Abbrevs[I].ParentForm) {
+      W.writeULEB128(dwarf::DW_IDX_parent);
+      W.writeULEB128(*Abbrevs[I].ParentForm);
+    }
+    W.writeULEB128(0);
+    W.writeULEB128(0);
+  }
+  W.writeULEB128(0);
+
+  // Entry pool.
+  for (uint32_t Idx : Order) {
+    const Entry &E = Entries[Idx];
+    for (uint32_t I = E.FirstValue; I < E.FirstValue + E.NumValues; ++I) {
+      const Value &V = Values[I];
+      uint32_t Number = AbbrevNumbers[I];
+      W.writeULEB128(Number);
+      if (HasUnitIndex)
+        W.writeUInt(CUidToIdx.lookup(V.UnitID), UnitIndexSize);
+      W.write<uint32_t>(V.DieOffset);
+      if (Abbrevs[Number - 1].ParentForm == dwarf::DW_FORM_ref4)
+        W.write<uint32_t>(
+            DIEOffsetToEntryOffset.lookup(Key(*V.ParentOffset, V)));
+    }
+    W.write<uint8_t>(0);
+  }
+
+  for (uint64_t I = 0; I < Padding; ++I)
+    W.write<uint8_t>(0);
+  assert(W.size() == 4 + Size + Padding);
+}
+} // anonymous namespace
+
+void DWARFLinkerImpl::emitDWARFv5DebugNamesSection() {
+  std::optional<DebugNamesTableBuilder> DebugNames;
+
+  SmallVector<uint64_t> CompUnits;
+  DenseMap<unsigned, unsigned> CUidToIdx;
 
   unsigned Id = 0;
 
   forEachCompileAndTypeUnit([&](DwarfUnit *CU) {
     bool HasRecords = false;
     CU->forEachAcceleratorRecord([&](const DwarfUnit::AccelInfo &Info) {
-      if (DebugNames == nullptr)
-        DebugNames = std::make_unique<DWARF5AccelTable>();
+      if (!DebugNames)
+        DebugNames.emplace();
 
       HasRecords = true;
       switch (Info.Type) {
       case DwarfUnit::AccelType::Name:
       case DwarfUnit::AccelType::Namespace:
       case DwarfUnit::AccelType::Type: {
-        DebugNames->addName(*DebugStrStrings.getExistingEntry(Info.String),
-                            Info.OutOffset, Info.ParentOffset, Info.Tag,
-                            CU->getUniqueID(),
-                            CU->getTag() == dwarf::DW_TAG_type_unit);
+        DebugNames->addName(
+            Info.String, *DebugStrStrings.getExistingEntry(Info.String),
+            {Info.OutOffset, Info.ParentOffset, CU->getUniqueID(), Info.Tag,
+             CU->getTag() == dwarf::DW_TAG_type_unit});
       } break;
 
       default:
@@ -1726,26 +2013,10 @@ void DWARFLinkerImpl::emitDWARFv5DebugNamesSection(const Triple &TargetTriple) {
     }
   });
 
-  if (DebugNames != nullptr) {
-    // FIXME: we use AsmPrinter to emit accelerator sections.
-    // It might be beneficial to directly emit accelerator data
-    // to the raw_svector_ostream.
-    SectionDescriptor &OutSection =
-        CommonSections.getSectionDescriptor(DebugSectionKind::DebugNames);
-    DwarfEmitterImpl Emitter(DWARFLinker::OutputFileType::Object,
-                             OutSection.OS);
-    if (Error Err = Emitter.init(TargetTriple, "__DWARF")) {
-      consumeError(std::move(Err));
-      return;
-    }
-
-    // Emit table.
-    Emitter.emitDebugNames(*DebugNames, CompUnits, CUidToIdx);
-    Emitter.finish();
-
-    // Set start offset ans size for output section.
-    OutSection.setSizesForSectionCreatedByAsmPrinter();
-  }
+  if (DebugNames)
+    DebugNames->emit(
+        CommonSections.getSectionDescriptor(DebugSectionKind::DebugNames),
+        CompUnits, CUidToIdx);
 }
 
 void DWARFLinkerImpl::cleanupDataAfterDWARFOutputIsWritten() {

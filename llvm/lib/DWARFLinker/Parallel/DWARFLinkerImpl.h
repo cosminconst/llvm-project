@@ -373,7 +373,7 @@ protected:
   void emitAppleAcceleratorSections(llvm::parallel::TaskGroup &TG);
 
   /// Emit .debug_names section.
-  void emitDWARFv5DebugNamesSection(const Triple &TargetTriple);
+  void emitDWARFv5DebugNamesSection();
 
   /// Emit string sections.
   void emitStringSections();
